@@ -1,7 +1,6 @@
 /*
  * goldy - DTLS proxy
  */
-
 #if defined(__linux__)
 #define _XOPEN_SOURCE 700
 #endif
@@ -41,8 +40,143 @@
 #include "log.h"
 #include "utlist.h"
 
+/* Use pre-shared key mode */
+#define DFL_PSK                 ""
+#define DFL_PSK_IDENTITY        "Client_identity"
+#define DFL_ECJPAKE_PW          NULL
+#define DFL_PSK_LIST            NULL
+
 /* Raise this value to have more verbose logging from mbedtls functions */
 #define MBEDTLS_DEBUG_LOGGING_LEVEL 0
+
+/* Used by sni_parse and psk_parse to handle coma-separated lists */
+#define GET_ITEM(dst) \
+  dst = p;            \
+  while (*p != ',')   \
+    if (++p > end)    \
+      goto error;     \
+  *p++ = '\0';
+
+#define HEX2NUM(c)                \
+  if (c >= '0' && c <= '9')       \
+    c -= '0';                     \
+  else if (c >= 'a' && c <= 'f')  \
+    c -= 'a' - 10;                \
+  else if (c >= 'A' && c <= 'F')  \
+    c -= 'A' - 10;                \
+  else                            \
+    return -1;
+
+/*
+ * Convert a hex string to bytes.
+ * Return 0 on success, -1 on error.
+ */
+int unhexify(unsigned char *output, const char *input, size_t *olen) {
+  unsigned char c;
+  size_t j;
+
+  *olen = strlen(input);
+
+  if (*olen % 2 != 0 || *olen / 2 > MBEDTLS_PSK_MAX_LEN) {
+    return -1;
+  }
+
+  *olen /= 2;
+
+  for (j = 0; j < *olen * 2; j += 2) {
+      c = input[j];
+      HEX2NUM(c);
+      output[ j / 2 ] = c << 4;
+
+      c = input[j + 1];
+      HEX2NUM(c);
+      output[ j / 2 ] |= c;
+  }
+
+  return 0;
+}
+
+typedef struct _psk_entry psk_entry;
+
+struct _psk_entry {
+  const char *name;
+  size_t key_len;
+  unsigned char key[MBEDTLS_PSK_MAX_LEN];
+  psk_entry *next;
+};
+
+/*
+ * Free a list of psk_entry's
+ */
+void psk_free(psk_entry *head) {
+  psk_entry *next;
+
+  while (head != NULL) {
+    next = head->next;
+    mbedtls_free(head);
+    head = next;
+  }
+}
+
+/*
+ * Parse a string of pairs name1,key1[,name2,key2[,...]]
+ * into a usable psk_entry list.
+ *
+ * Modifies the input string! This is not production quality!
+ */
+psk_entry *psk_parse(char *psk_string) {
+  psk_entry *cur = NULL, *new = NULL;
+  char *p = psk_string;
+  char *end = p;
+  char *key_hex;
+
+  while (*end != '\0') {
+    ++end;
+  }
+  *end = ',';
+
+  while (p <= end) {
+    if ((new = mbedtls_calloc(1, sizeof(psk_entry))) == NULL)
+      goto error;
+
+    memset(new, 0, sizeof(psk_entry));
+
+    GET_ITEM(new->name);
+    GET_ITEM(key_hex);
+
+    if (unhexify(new->key, key_hex, &new->key_len) != 0)
+      goto error;
+
+    new->next = cur;
+    cur = new;
+  }
+
+  return cur;
+
+error:
+  psk_free(new);
+  psk_free(cur);
+  return 0;
+}
+
+/*
+ * PSK callback
+ */
+int psk_callback(void *p_info, mbedtls_ssl_context *ssl,
+                 const unsigned char *name, size_t name_len) {
+  psk_entry *cur = (psk_entry *) p_info;
+
+  while (cur != NULL) {
+    if (name_len == strlen(cur->name) && 
+        memcmp(name, cur->name, name_len) == 0) {
+      return mbedtls_ssl_set_hs_psk(ssl, cur->key, cur->key_len);
+    }
+
+    cur = cur->next;
+  }
+
+  return -1;
+}
 
 /* Delete all the items in a singly-linked list */
 #define LL_PURGE(head)                 \
@@ -72,8 +206,10 @@ static void print_usage() {
      "  -t, --timeout=SECONDS      Session timeout (seconds)\n"
      "  -l, --listen=ADDR:PORT     listen for incoming DTLS on addr and UDP port\n"
      "  -b, --backend=ADDR:PORT    proxy UDP traffic to addr and port\n"
-     "  -c, --cert=FILE            TLS certificate PEM filename\n"
-     "  -k, --key=FILE             TLS private key PEM filename\n");
+     "  -i, --identity=FILE        PSK identity\n"
+     "  -p, --psk=FILE             PSK key\n");
+     //"  -c, --cert=FILE            TLS certificate PEM filename\n"
+     //"  -k, --key=FILE             TLS private key PEM filename\n");
 }
 
 /** Parse command line arguments.
@@ -85,7 +221,7 @@ static int get_options(int argc, char **argv, struct instance *gi) {
 
   char *sep;
 
-  static const char *short_options = "hvdb:g:l:c:k:t:";
+  static const char *short_options = "hvdb:g:l:i:p:t:";
 
   static struct option long_options[] = {
     {"help", no_argument, NULL, 'h'},
@@ -94,14 +230,18 @@ static int get_options(int argc, char **argv, struct instance *gi) {
     {"backend", required_argument, NULL, 'b'},
     {"log", optional_argument, NULL, 'g'},
     {"listen", required_argument, NULL, 'l'},
-    {"cert", required_argument, NULL, 'c'},
-    {"key", required_argument, NULL, 'k'},
+//    {"cert", required_argument, NULL, 'c'},
+//    {"key", required_argument, NULL, 'k'},
+    {"identity", required_argument, NULL, 'i'},
+    {"psk", required_argument, NULL, 'p'},
     {"timeout", optional_argument, NULL, 't'},
     {0, 0, 0, 0}
   };
 
   memset(gi, 0, sizeof(*gi));
   gi->session_timeout = DEFAULT_SESSION_TIMEOUT;
+
+  gi->psk_list = NULL;
 
   while ((opt = getopt_long(argc, argv, short_options, long_options,
                             NULL)) != -1) {
@@ -143,11 +283,17 @@ static int get_options(int argc, char **argv, struct instance *gi) {
       gi->listen_host = optarg;
       gi->listen_port = sep + 1;
       break;
-    case 'c':                /* -c, --cert=S */
-      gi->cert_file = optarg;
+    //case 'c':                /* -c, --cert=S */
+    //  gi->cert_file = optarg;
+    //  break;
+    //case 'k':                /* -k, --key=S */
+    //  gi->private_key_file = optarg;
+    //  break;
+    case 'i':                /* -i, --identity=S */           
+      gi->psk_identity = optarg;
       break;
-    case 'k':                /* -k, --key=S */
-      gi->private_key_file = optarg;
+    case 'p':                /* -p, --psk=S */
+      gi->psk = optarg;
       break;
     case 't':                /* -t, --timeout=I */
       gi->session_timeout = atoi(optarg);
@@ -159,7 +305,8 @@ static int get_options(int argc, char **argv, struct instance *gi) {
 
   if (!(gi->listen_host && gi->listen_port &&
         gi->backend_host && gi->backend_port &&
-        gi->cert_file && gi->private_key_file)) {
+        gi->psk_identity && gi->psk)) {
+        //gi->cert_file && gi->private_key_file)) {
     log_error("Mandatory param missing. Bye.\n");
     return 0;
   }
@@ -185,11 +332,14 @@ typedef struct {
   mbedtls_entropy_context entropy;
   mbedtls_ctr_drbg_context ctr_drbg;
   mbedtls_ssl_config conf;
-  mbedtls_x509_crt srvcert;
-  mbedtls_pk_context pkey;
+  //mbedtls_x509_crt srvcert;
+  //mbedtls_pk_context pkey;
 #if defined(MBEDTLS_SSL_CACHE_C)
   mbedtls_ssl_cache_context cache;
 #endif
+  unsigned char psk[MBEDTLS_PSK_MAX_LEN];
+  size_t psk_len;
+  psk_entry *psk_info;
 } global_context;
 
 static void global_cb(EV_P_ ev_io *w, int revents);
@@ -199,8 +349,8 @@ static int global_deinit(global_context *gc) {
 
   mbedtls_net_free(&gc->listen_fd);
 
-  mbedtls_x509_crt_free(&gc->srvcert);
-  mbedtls_pk_free(&gc->pkey);
+  //mbedtls_x509_crt_free(&gc->srvcert);
+  //mbedtls_pk_free(&gc->pkey);
   mbedtls_ssl_config_free(&gc->conf);
   mbedtls_ssl_cookie_free(&gc->cookie_ctx);
 #if defined(MBEDTLS_SSL_CACHE_C)
@@ -208,6 +358,7 @@ static int global_deinit(global_context *gc) {
 #endif
   mbedtls_ctr_drbg_free(&gc->ctr_drbg);
   mbedtls_entropy_free(&gc->entropy);
+  psk_free(gc->psk_info);
 
   return ret == 0 ? 0 : 1;
 }
@@ -248,10 +399,28 @@ static int global_init(const struct instance *gi, global_context *gc) {
 #if defined(MBEDTLS_SSL_CACHE_C)
   mbedtls_ssl_cache_init(&gc->cache);
 #endif
-  mbedtls_x509_crt_init(&gc->srvcert);
-  mbedtls_pk_init(&gc->pkey);
+  //mbedtls_x509_crt_init(&gc->srvcert);
+  //mbedtls_pk_init(&gc->pkey);
   mbedtls_entropy_init(&gc->entropy);
   mbedtls_ctr_drbg_init(&gc->ctr_drbg);
+
+  // PSK
+  gc->psk_len = 0;
+  gc->psk_info = NULL;
+
+  /* Unhexify the pre-shared key and parse the list if any given */
+  if((ret = unhexify(gc->psk, gi->psk, &gc->psk_len)) != 0) {
+    log_error("pre-shared key not valid hex\n");
+    goto exit;
+  }
+
+  if(gi->psk_list != NULL) {
+    if((gc->psk_info = psk_parse(gi->psk_list)) == NULL) {
+      log_error("psk_list invalid");
+      goto exit;
+    }
+  }
+  // PSK
 
   log_info("Goldy %s starting up", GOLDY_VERSION);
   mbedtls_net_init(&gc->listen_fd);
@@ -266,24 +435,24 @@ static int global_init(const struct instance *gi, global_context *gc) {
   }
 #endif
 
-  ret = mbedtls_x509_crt_parse_file(&gc->srvcert, gi->cert_file);
-  if (ret != 0) {
-    log_error("mbedtls_x509_crt_parse returned %d", ret);
-    goto exit;
-  }
-  log_debug("Loaded server certificate file");
+  //ret = mbedtls_x509_crt_parse_file(&gc->srvcert, gi->cert_file);
+  //if (ret != 0) {
+  //  log_error("mbedtls_x509_crt_parse returned %d", ret);
+  //  goto exit;
+  //}
+  //log_debug("Loaded server certificate file");
 
-  ret = mbedtls_pk_parse_keyfile(&gc->pkey, gi->private_key_file, NULL);
-  if (ret != 0) {
-    log_error("mbedtls_pk_parse_key returned %d", ret);
-    goto exit;
-  }
-  log_debug("Loaded private key file");
+  //ret = mbedtls_pk_parse_keyfile(&gc->pkey, gi->private_key_file, NULL);
+  //if (ret != 0) {
+  //  log_error("mbedtls_pk_parse_key returned %d", ret);
+  //  goto exit;
+  //}
+  //log_debug("Loaded private key file");
 
   if ((ret = mbedtls_ctr_drbg_seed(&gc->ctr_drbg, mbedtls_entropy_func,
                                    &gc->entropy, (const unsigned char *)pers,
                                    strlen(pers))) != 0) {
-    printf(" failed\n  ! mbedtls_ctr_drbg_seed returned %d\n", ret);
+    log_error(" failed\n  ! mbedtls_ctr_drbg_seed returned %d\n", ret);
     goto exit;
   }
   log_debug("Seeded random number generator");
@@ -306,11 +475,11 @@ static int global_init(const struct instance *gi, global_context *gc) {
                                  mbedtls_ssl_cache_set);
 #endif
 
-  mbedtls_ssl_conf_ca_chain(&gc->conf, gc->srvcert.next, NULL);
-  if ((ret = mbedtls_ssl_conf_own_cert(&gc->conf, &gc->srvcert, &gc->pkey)) != 0) {
-    log_error("mbedtls_ssl_conf_own_cert returned %d", ret);
-    goto exit;
-  }
+  //mbedtls_ssl_conf_ca_chain(&gc->conf, gc->srvcert.next, NULL);
+  //if ((ret = mbedtls_ssl_conf_own_cert(&gc->conf, &gc->srvcert, &gc->pkey)) != 0) {
+  //  log_error("mbedtls_ssl_conf_own_cert returned %d", ret);
+  //  goto exit;
+  //}
   if ((ret = mbedtls_ssl_cookie_setup(&gc->cookie_ctx,
                                       mbedtls_ctr_drbg_random,
                                       &gc->ctr_drbg)) != 0) {
@@ -321,6 +490,23 @@ static int global_init(const struct instance *gi, global_context *gc) {
                                 mbedtls_ssl_cookie_check, &gc->cookie_ctx);
   log_info("Proxy is ready, listening for connections on UDP %s:%s",
            gi->listen_host, gi->listen_port);
+
+  // PSK
+  if(strlen(gi->psk) != 0 && strlen(gi->psk_identity) != 0) {
+    ret = mbedtls_ssl_conf_psk(&gc->conf, gc->psk, gc->psk_len,
+          (const unsigned char *) gi->psk_identity,
+          strlen(gi->psk_identity));
+
+    if(ret != 0) {
+      log_error("  failed\n  mbedtls_ssl_conf_psk returned -0x%04X\n\n", - ret);
+      goto exit;
+    }
+  }
+
+  if(gi->psk_list != NULL) {
+    mbedtls_ssl_conf_psk_cb(&gc->conf, psk_callback, gc->psk_info);
+  }
+  // PSK
 
  exit:
   check_return_code(ret, "global_init - exit");
@@ -379,10 +565,11 @@ static int session_init(const global_context *gc,
 
   memset(sc, 0, sizeof(*sc));
   memcpy(&sc->client_fd, client_fd, sizeof(sc->client_fd));
-  if (cliip_len > sizeof(sc->client_ip)) {
-    log_error("session_init - client_ip size mismatch");
-    return 1;
-  }
+  //if (cliip_len > sizeof(sc->client_ip)) {
+  //  log_error("%d %d", cliip_len, sizeof(sc->client_ip));
+  //  log_error("session_init - client_ip size mismatch");
+  //  return 1;
+  //}
   memcpy(&sc->client_ip, client_ip, cliip_len);
   sc->cliip_len = cliip_len;
   mbedtls_ssl_init(&sc->ssl);
@@ -427,6 +614,7 @@ static void session_free(EV_P_ session_context *sc) {
 
   log_info("(%s:%d) Session closed", sc->client_ip_str, sc->client_port);
   free(sc);
+  sc = NULL;
 }
 
 static void session_mark_activity(EV_P_ session_context *sc) {
@@ -610,6 +798,17 @@ static void session_receive_from_client(EV_P_ session_context *sc) {
     sc->step = GOLDY_SESSION_STEP_FLUSH_TO_BACKEND;
     return;
 
+  /* handle reconnect from same port */
+  case MBEDTLS_ERR_SSL_CLIENT_RECONNECT:
+    log_info("(%s:%d) Client initiated a reconnect from the same port",
+             sc->client_ip_str, sc->client_port);
+
+    ev_io_start(EV_A_ &sc->backend_wr_watcher);
+    sc->step = GOLDY_SESSION_STEP_HANDSHAKE;
+
+    //session_deferred_free(sc, "client reconnect");
+    return;
+
   default:
     if (ret < 0) {
       session_deferred_free_after_error(sc, ret, "session_receive_from_client - unknwon error");
@@ -765,7 +964,6 @@ static void session_step_close_notify(EV_P_ ev_io *w, int revents,
                                       session_context *sc) {
   int ret;
 
-  (void)loop;
   (void)w;
   (void)revents;
 

@@ -11,8 +11,11 @@ struct instance {
   char *listen_port;
   char *backend_host;
   char *backend_port;
-  char *cert_file;
-  char *private_key_file;
+//  char *cert_file;
+//  char *private_key_file;
+  const char *psk;
+  const char *psk_identity;
+  char *psk_list;
   int daemonize;
   int session_timeout;          /* in seconds */
 };
